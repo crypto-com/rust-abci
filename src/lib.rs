@@ -14,27 +14,32 @@
 //!
 //! impl abci::Application for EmptyApp {}
 //!
-//! fn main() {
+//! fn run_empty_app() {
 //!     abci::run_local(EmptyApp);
 //! }
 //!```
 //!
+extern crate byteorder;
+extern crate bytes;
+extern crate env_logger;
+extern crate futures;
+extern crate integer_encoding;
+#[macro_use]
+extern crate log;
+extern crate core;
+extern crate protobuf;
+extern crate tokio;
+
 use std::net::SocketAddr;
 
-extern crate bytes;
-extern crate integer_encoding;
-extern crate mockstream;
-extern crate protobuf;
+pub use crate::messages::abci::*;
+pub use crate::messages::merkle::*;
+pub use crate::messages::types::*;
+use crate::server::serve;
 
+mod codec;
 mod messages;
 mod server;
-mod stream;
-
-pub use messages::abci::*;
-pub use messages::merkle::*;
-pub use messages::types::*;
-
-use server::serve;
 
 /// Main Trait for an ABCI application. Provides generic responses for all callbacks
 /// Override desired callbacks as needed.  Tendermint makes 3 TCP connections to the

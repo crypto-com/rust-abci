@@ -1,63 +1,86 @@
-use Application;
-
-use std::io;
-use std::net::*;
+use std::net::SocketAddr;
 use std::ops::DerefMut;
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::Arc;
 
-use messages::abci::*;
-use stream::AbciStream;
+use env_logger::Env;
+use futures::sink::SinkExt;
+use futures::stream::StreamExt;
+use tokio::net::TcpListener;
+use tokio::runtime;
+use tokio::sync::Mutex;
+use tokio_util::codec::Decoder;
 
-/// Creates the TCP server and listens for connections from Tendermint
-pub fn serve<A>(app: A, addr: SocketAddr) -> io::Result<()>
+use crate::codec::ABCICodec;
+use crate::messages::abci::*;
+use crate::Application;
+
+async fn serve_async<A>(app: A, addr: SocketAddr)
 where
     A: Application + 'static + Send + Sync,
 {
-    let listener = TcpListener::bind(addr).unwrap();
-
-    // Wrap the app atomically and clone for each connection.
     let app = Arc::new(Mutex::new(app));
-
-    for new_connection in listener.incoming() {
-        let app_instance = Arc::clone(&app);
-        match new_connection {
-            Ok(stream) => {
-                println!("Got connection! {:?}", stream);
-                thread::spawn(move || handle_stream(AbciStream::from(stream), &app_instance));
+    let mut listener = TcpListener::bind(&addr).await.unwrap();
+    while let Some(Ok(socket)) = listener.next().await {
+        let app_instance = app.clone();
+        tokio::spawn(async move {
+            info!("Got connection! {:?}", socket);
+            let framed = ABCICodec::new().framed(socket);
+            let (mut writer, mut reader) = framed.split();
+            let mut mrequest = reader.next().await;
+            while let Some(Ok(ref request)) = mrequest {
+                debug!("Got Request! {:?}", request);
+                let response = respond(&app_instance, request).await;
+                debug!("Return Response! {:?}", response);
+                writer.send(response).await.expect("sending back response");
+                mrequest = reader.next().await;
             }
-            Err(err) => {
-                // We need all 3 connections...
-                panic!("Connection failed: {}", err);
+            match mrequest {
+                None => {
+                    panic!("connection dropped");
+                }
+                Some(Err(e)) => {
+                    panic!("decoding error: {:?}", e);
+                }
+                _ => {
+                    unreachable!();
+                }
             }
-        }
+        });
     }
-    drop(listener);
+}
+
+/// Creates the TCP server and listens for connections from Tendermint
+pub fn serve<A>(app: A, addr: SocketAddr) -> std::io::Result<()>
+where
+    A: Application + 'static + Send + Sync,
+{
+    env_logger::from_env(Env::default().default_filter_or("info"))
+        .try_init()
+        .ok();
+
+    let mut rt = runtime::Builder::new()
+        .basic_scheduler()
+        .enable_io()
+        .build()
+        .unwrap();
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        std::process::exit(1);
+    }));
+    rt.block_on(serve_async(app, addr));
     Ok(())
 }
 
-fn handle_stream<A>(mut stream: AbciStream, app: &Arc<Mutex<A>>)
+async fn respond<A>(app: &Arc<Mutex<A>>, request: &Request) -> Response
 where
     A: Application + 'static + Send + Sync,
 {
-    loop {
-        match stream.read_request() {
-            Some(req) => {
-                let mut guard = app.lock().unwrap();
-                let a = guard.deref_mut();
-                respond(&mut stream, a, &req).unwrap();
-            }
-            _ => break,
-        }
-    }
-    println!("Connection closed on {:?}", stream);
-}
+    let mut guard = app.lock().await;
+    let app = guard.deref_mut();
 
-fn respond<A>(stream: &mut AbciStream, app: &mut A, request: &Request) -> io::Result<()>
-where
-    A: Application + 'static + Send + Sync,
-{
     let mut response = Response::new();
+
     match request.value {
         // Info
         Some(Request_oneof_value::info(ref r)) => response.set_info(app.info(r)),
@@ -94,7 +117,5 @@ where
             response.set_exception(re)
         }
     }
-
-    stream.write_response(&response)?;
-    Ok(())
+    response
 }
